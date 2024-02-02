@@ -16,19 +16,19 @@ class PositionalEmbedding(nn.Module):
     def __init__(self, demb):
         super(PositionalEmbedding, self).__init__()
 
-        self.demb = demb
+        self.demb = demb  # demb 指的是相对位置编码的维度 也即嵌入维度
 
         inv_freq = 1 / (10000 ** (torch.arange(0.0, demb, 2.0) / demb))
         self.register_buffer('inv_freq', inv_freq)
 
     def forward(self, pos_seq, bsz=None):
-        sinusoid_inp = torch.ger(pos_seq, self.inv_freq)
-        pos_emb = torch.cat([sinusoid_inp.sin(), sinusoid_inp.cos()], dim=-1)
+        sinusoid_inp = torch.ger(pos_seq, self.inv_freq)  # [batch_size, seq_length × (d_emb / 2)]
+        pos_emb = torch.cat([sinusoid_inp.sin(), sinusoid_inp.cos()], dim=-1)  # [batch_size, seq_length × d_emb]
 
         if bsz is not None:
             return pos_emb[:,None,:].expand(-1, bsz, -1)
         else:
-            return pos_emb[:,None,:]
+            return pos_emb[:,None,:]  # [batch_size, 1, seq_length × d_emb]
 
 
 class PositionwiseFF(nn.Module):
@@ -150,11 +150,11 @@ class RelMultiHeadAttn(nn.Module):
         self.d_head = d_head
         self.dropout = dropout
 
-        self.qkv_net = nn.Linear(d_model, 3 * n_head * d_head, bias=False)
+        self.qkv_net = nn.Linear(d_model, 3 * n_head * d_head, bias=False)  # qkv_net是生成Attention中QKV矩阵
 
         self.drop = nn.Dropout(dropout)
         self.dropatt = nn.Dropout(dropatt)
-        self.o_net = nn.Linear(n_head * d_head, d_model, bias=False)
+        self.o_net = nn.Linear(n_head * d_head, d_model, bias=False)  # o_net是把多注意力头的结果拼接之后转换成模型维度的矩阵
 
         self.layer_norm = nn.LayerNorm(d_model)
 
@@ -216,6 +216,9 @@ class RelPartialLearnableMultiHeadAttn(RelMultiHeadAttn):
         self.r_net = nn.Linear(self.d_model, self.n_head * self.d_head, bias=False)
 
     def forward(self, w, r, r_w_bias, r_r_bias, attn_mask=None, mems=None):
+        # w是当前segment的上一个本隐藏状态，大小是seq_length * batch_size
+        # r相对位置编码
+        # mem是上一个segment的隐藏状态
         qlen, rlen, bsz = w.size(0), r.size(0), w.size(1)
 
         if mems is not None:
@@ -226,31 +229,32 @@ class RelPartialLearnableMultiHeadAttn(RelMultiHeadAttn):
                 w_heads = self.qkv_net(cat)
             r_head_k = self.r_net(r)
 
-            w_head_q, w_head_k, w_head_v = torch.chunk(w_heads, 3, dim=-1)
-            w_head_q = w_head_q[-qlen:]
+            w_head_q, w_head_k, w_head_v = torch.chunk(w_heads, 3, dim=-1)  # 沿着最后一个维度分成3块
+            w_head_q = w_head_q[-qlen:]  # q只利用w计算, k和v利用w和mems计算, 故这里对q做截断
         else:
             if self.pre_lnorm:
                 w_heads = self.qkv_net(self.layer_norm(w))
             else:
                 w_heads = self.qkv_net(w)
-            r_head_k = self.r_net(r)
+            r_head_k = self.r_net(r)  # 论文中的Q矩阵
 
             w_head_q, w_head_k, w_head_v = torch.chunk(w_heads, 3, dim=-1)
 
         klen = w_head_k.size(0)
 
+        # 维度转换: seq_length * batch_size * n_head * d_head，其中seq_length是输入文本中最长的长度，batch_size是batch的长度，n_head是注意力头的个数，d_head是每个头的隐藏维度
         w_head_q = w_head_q.view(qlen, bsz, self.n_head, self.d_head)           # qlen x bsz x n_head x d_head
         w_head_k = w_head_k.view(klen, bsz, self.n_head, self.d_head)           # qlen x bsz x n_head x d_head
         w_head_v = w_head_v.view(klen, bsz, self.n_head, self.d_head)           # qlen x bsz x n_head x d_head
 
         r_head_k = r_head_k.view(rlen, self.n_head, self.d_head)                # qlen x n_head x d_head
 
-        #### compute attention score
-        rw_head_q = w_head_q + r_w_bias                                         # qlen x bsz x n_head x d_head
-        AC = torch.einsum('ibnd,jbnd->ijbn', (rw_head_q, w_head_k))             # qlen x klen x bsz x n_head
+        #### compute attention score  即计算论文中的A，包含a b c d 四项
+        rw_head_q = w_head_q + r_w_bias                                         # qlen x bsz x n_head x d_head, r_w_bias是论文中的u
+        AC = torch.einsum('ibnd,jbnd->ijbn', (rw_head_q, w_head_k))             # qlen x klen x bsz x n_head  将a和c两项合并在一起计算
 
-        rr_head_q = w_head_q + r_r_bias
-        BD = torch.einsum('ibnd,jnd->ijbn', (rr_head_q, r_head_k))              # qlen x klen x bsz x n_head
+        rr_head_q = w_head_q + r_r_bias  # r_r_bias 是论文中的v矩阵
+        BD = torch.einsum('ibnd,jnd->ijbn', (rr_head_q, r_head_k))              # qlen x klen x bsz x n_head  将b和d两项合在一起计算
         BD = self._rel_shift(BD)
 
         # [qlen x klen x bsz x n_head]
@@ -412,7 +416,7 @@ class RelLearnableDecoderLayer(nn.Module):
 
 class RelPartialLearnableDecoderLayer(nn.Module):
     def __init__(self, n_head, d_model, d_head, d_inner, dropout,
-                 **kwargs):
+                 **kwargs):  # n_head, d_model, d_head分别表示注意力头的个数, 模型的隐藏层维度, 每个头的隐藏维度
         super(RelPartialLearnableDecoderLayer, self).__init__()
 
         self.dec_attn = RelPartialLearnableMultiHeadAttn(n_head, d_model,
@@ -524,7 +528,7 @@ class MemTransformerLM(nn.Module):
         self.attn_type = attn_type
 
         self.layers = nn.ModuleList()
-        if attn_type == 0: # the default attention
+        if attn_type == 0: # the default attention  # attn_type为0就是文中的Transformer-XL
             for i in range(n_layer):
                 self.layers.append(
                     RelPartialLearnableDecoderLayer(
